@@ -1,0 +1,72 @@
+start mis-exporter(parmfile, option, regid, retcode)
+
+parmfile    is x
+option      is x
+regid       is x
+retcode     is b
+
+db          is b
+readid      is x
+
+expt_def    is x
+scripts[]   is x
+parms[]     is x
+opts[]      is x
+
+i           is b
+rc          is b
+t           is x
+
+db = 2
+expt_def = "sql-export"
+
+'define your scripts here
+'i = 0
+'scripts[++i] = my_cust_script
+'scripts[++i] = my_cust_script
+'scripts[++i] = my_cust_script
+'
+'define your parms here
+'i = 0
+'parms[++i] = my_parm_4_script_i
+'parms[++i] = my_parm_4_script_i
+'parms[++i] = my_parm_4_script_i
+'
+'define your options here
+'i = 0
+'opts[++i] = my_option_4_script_i
+'opts[++i] = my_option_4_script_i
+'opts[++i] = my_option_4_script_i
+
+'load the parm / option args
+getparm(parmfile)
+getoption(option)
+
+if regid !dp then
+   (void)$dbstart(db, readid)
+else
+   readid = regid
+endif
+
+rc = $dbread(db, readid)
+do while rc < 3
+   i = 0
+   do while i++ < $maxarray(scripts[], parms[], opts[])
+      if scripts[i] dp then
+         t = scripts[i]
+      else
+         t = expt_def
+      endif
+      call t (parms[i], opts[i], readid, retcode)
+   enddo
+   if readid = regid then
+      rc = 99
+   else
+      rc = $dbreadnext(db, readid)
+   endif
+enddo
+
+end mis-exporter
+
+%include inc_GetParm
+%include inc_GetOption

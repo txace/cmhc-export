@@ -1,0 +1,451 @@
+'PARM-BASED EXPORT TO SQL
+'TxACE
+'Original code and concept by Tim Markello
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+' *** TODO ***
+' - be able to include the same DST values from a standalone (C.ID)
+'   even while reading down into layers of a record.
+
+%define d_Admin "roberte@gcmhmr.com"
+%define d_archive "/c0/conv"
+%define d_RowDump 32000
+%define d_SkipParm "CVSKIP"
+
+%debug compile
+
+'PARMS:
+'  SQL_TABLE: dbo.TableName
+'  SQLDSNFILE: dsnname
+'     ^^ use this or SQLDSN
+'     ^^ this DSN is used by the LIB-freetds
+'  SQL_EXEC (Y/N): default: Y - Determines if this script will execute
+'        SQL statements
+'  SQL_TRUNCATE (Y/N): default: Y - truncate table prior to processing?
+'  ARCH_PATH: /path/to/sql/archive
+'  ARCH_CLEAN (Y/N): Remove unix file before processing?
+'  REGCLEAN: uscript hook to call on the first register read
+'  RECCLEAN: uscript hook to call on subsequent layers
+'  LAYERS: number of layers to process (leave blank for everything)
+'  SQL_COL-XX corresponding SQL column the data should go into
+'  CON-XX: A constant value to be used in all records
+'  DST-XX: DST to read.  replace XX with a number
+'     eg: DST-1 C.ID
+'         DST-2 C.FN
+'  DST_LKP-XX: USE THE LOOKUP VALUE
+'  DST_EFF-XX: use an effective date for this field
+'     values: Y - use the DST's effective date
+'     values: integer - map the effective date of another DST to this field.
+'     eg:
+'     assume DST-2 C.FN
+'     DST_EFF-3 2
+'     ^^ this means the effective date of C.FN will be placed into DST-3
+'     ^^ can be used as a 'virtual' field to insert the value and effd
+'        of a single DST into different SQL columns
+'  DST_REQ-XX: require data in a field in order to be exported.
+'        this will help to avoid completely null rows
+'     values: Y/N
+'     example:
+'     DST_REQ-2 Y
+'  REGLIMIT: XX
+'     limit processing to a specific number of registers
+'     to be used in testing
+'  SKIPPARM: [PARMFILE]
+'     specify a parmfile (default: CVSKIP) containing clients to *NOT* export
+'     format: one client ID per line
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+%version 01.0.007 07/26/13 TxACE
+
+start sql-export(parmfile, option, regid, retcode)
+
+$looplimit = 0
+
+parmfile    is x
+option      is x
+regid       is x
+retcode     is b
+
+sql_table   is x
+arch_path   is x
+arch_clean  is x
+sql_col[]   is x
+sql_col_def is x
+id_col_def  is x
+sql_exec    is x
+sql         is x
+sql-create  is x
+sql_buf[]   is x
+sql_truncate   is x
+sql_create  is x
+skipparm    is x
+skip[]      is x
+
+db          is b
+readid      is x
+dst[]       is x
+con[]       is x
+values[]    is x
+dst_eff[]   is x
+dst_req[]   is x
+dst_lkp[]   is x
+dstinfo[]   is x
+effd[]      is d
+dsttype     is x
+dstname     is x
+ptr         is i
+
+regclean    is x
+recclean    is x
+reglimit    is n
+reg_cnt     is n
+layers      is n
+layer_cnt   is n
+reqCnt      is i
+reqTot      is i
+
+sqldsn      is x
+sqldsnfile  is x
+
+dstlib_src  is x
+l-d         is b
+sqllib_src  is x
+l-s         is b
+
+t           is x
+i           is b
+rc          is b
+rc_sql      is b
+tFile       is x
+cmd         is x
+
+admin       is x
+
+gosub __INIT
+gosub __MAIN
+gosub _SQLIMPORT
+
+$cleartempfile(tFile)
+
+return
+
+
+__MAIN:
+   rc = l-d:read(readid,dst[])
+   do while rc < 3
+      %debugstart
+      if $operioallow = "Y" then
+         $disp(`"READ: " + readid`,1,1,,"H")
+      endif
+      %debugend
+
+      if $find(readid,skip[],,"F") = 0 then
+         $clear(layer_cnt,values[],effd[])
+         l-d:listinfo(dst[], values[], effd[])
+         if regclean dp then
+            call regclean (readid, dst[], values[], effd[])
+         endif
+         
+         gosub _SQLGEN
+         
+         if ((layers < 1) OR (++layer_cnt < layers)) then
+            rc = l-d:nextRec()
+            do while rc < 2
+               $clear(values[],effd[])
+               l-d:listinfo(dst[], values[], effd[])
+         
+               if recclean dp then
+                  call recclean (readid, dst[], values[], effd[])
+               endif
+         
+               gosub _SQLGEN
+         
+               rc = l-d:nextRec()
+         
+            enddo
+         endif
+      endif
+      if readid = regid then
+         rc = 99
+      else
+         if $maxarray(sql_buf[]) >= d_RowDump then
+            gosub _SQLIMPORT
+         endif
+         rc = l-d:next()
+         readid = l-d:reg()
+      endif
+      
+      if reglimit > 0 and ++reg_cnt > reglimit then
+         rc = 99
+      endif
+   enddo
+
+goback
+
+_SQLGEN:
+
+   '* map effective dates
+   if dst_eff[] dp then
+      i = 0
+      do while i++ < $maxarray(dst_eff[])
+         if dst_eff[i] dp then
+            if dst_eff[i] = "Y" then
+               values[i] = effd[i]
+            elseif $num(dst_eff[i]) > 0 then
+               ptr = $num(dst_eff[i])
+               values[i] = effd[ptr]
+            endif
+         endif
+      enddo
+   endif
+
+   '* DCT lookup
+   if dst_lkp[] dp then
+      i = 0
+      do while i++ < $maxarray(dst_lkp[])
+         if dst_lkp[i] dp then
+            rc = $dstinfo(dst[i], dstinfo[])
+            '*Do DCT lookup
+            '#thumb - other lookups not supported
+            select $num(dstinfo[6])
+               case 1
+                  values[i] = $dct(`$num(dstinfo[8])`,values[i],"D")
+            endselect
+         endif
+      enddo
+   endif
+
+   '* constants
+   if con[] dp then
+      i = 0
+      do while i++ < $maxarray(con[])
+         if con[i] dp then
+            values[i] = con[i]
+         endif
+      enddo
+   endif
+
+   '#thumb - workaround to include client ID on each row.
+   'don't hardcode this.../?
+   i = 0
+   do while i++ < $maxarray(dst[])
+      if $uc(dst[i]) = "C.ID" and values[i] !dp then
+         values[i] = readid
+         'values[i] = $num(readid)
+      endif
+   enddo
+
+   '*determine if we have all required fields
+   $clear(reqCnt,reqTot)
+   if dst_req[] dp then
+      i = 0
+      do while i++ < $maxarray(dst_req[])
+         if dst_req[i] = "Y" then
+            reqCnt++
+            if values[i] dp then
+               reqTot++
+            endif
+         endif
+      enddo
+   endif
+
+   '* continue processing / import
+   if reqCnt < 1 or (reqCnt > 0 and reqCnt = reqTot) then
+      '* cleanup NULLS
+      i = 0
+      do while i++ < $maxarray(dst[],sql_col[])
+         if values[i] !dp then
+            'values[i] = "%MENULL%" 'kind of hackish
+            values[i] = "NULL"
+         else
+            if $find(x"27",values[i]) > 0 then
+               values[i] = l-s:quote_field(values[i])
+            endif
+            values[i] = "'" + values[i] + "'"
+         endif
+
+      enddo
+      
+      '(void)$putds(values[], t,",","'")
+      t = ""
+
+      'insert the readid to maintain the relation
+      t += "'" + readid + "'," + x"0d" + x"0a"
+
+      'process dst value to match columns
+      i = 0
+      do while ++i < $maxarray(values[])
+         t += values[i] + "," + x"0d" + x"0a"
+      enddo
+      t += values[i]
+      t = $replace(`"%" + $varname(values[]) + "%"`, t, sql)
+      't = $replace("'%MENULL%'","NULL",t)
+      (void)$arrPush(sql_buf[],t)
+   endif
+
+goback
+
+_SQLIMPORT:
+   if $maxarray(sql_buf[]) = 0 then goback endif
+
+   '* EXECUTE
+   rc = $putfile(sql_buf[],tFile)
+   
+   if sql_exec = "Y" then
+      rc_sql = l-s:q_by_file(tFile)
+      if rc_sql > 0 then
+         $errmsg1 = $fmt(rc_sql,"ERROR: 99")
+         '$errmsg2 = t
+         (void)$email(admin,`$scriptid + " " + parmfile + " ERROR"`, sql_buf[])
+         'return
+      endif
+   endif
+
+'   $disp(`"TFILE=" + tFile`)
+'   $acpt()
+
+   '* LOG TO ARCHIVE FILE
+   if arch_path dp then
+      cmd = "cat " + tFile + " >> " + arch_path + "/" + sql_table
+      rc = $unix(cmd)
+      if rc > 0 then
+         $errmsg1 = "CMD ERR"
+      endif
+   endif
+   $clear(sql_buf[])
+goback
+
+__INIT:
+   db = 2
+   sqldsnfile = "/c0/DEV/SCRIPT/D/freetds/webapp_prod.ds"
+   dstlib_src = "lib_DST"
+   sqllib_src = "LIB-freetds"
+   sql = "INSERT INTO %SQL_TABLE% ( %SQL_COL% ) VALUES ( %VALUES% );"
+   sql-create = "IF OBJECT_ID('%SQL_TABLE%') IS NULL" + x"0a" + "CREATE TABLE %SQL_TABLE% (%SQL_COL_DEF%);"
+   sql_exec = "Y"
+   sql_truncate = "Y"
+   arch_clean  = "Y"
+   arch_path = d_archive
+   skipparm = d_SkipParm
+   admin = d_Admin
+   id_col_def = "ClientID"
+   
+   getParm(parmfile)
+   getoption(option)
+   
+   (void)$loadlib(l-d, dstlib_src)
+   (void)$loadlib(l-s, sqllib_src)
+   
+   if sql_table !dp then return endif
+   if sql_col[] !dp then return endif
+   if dst[] !dp then return endif
+   
+   if id_col_def !dp then
+      id_col_def = "ID"
+   endif
+
+   '(void)$putds(sql_col[], t)
+   t = ""
+   'insert the read it to maintain relationship
+   t += id_col_def + "," + x"0d" + x"0a"
+
+   'add the dst columns
+   i = 0
+   do while ++i < $maxarray(sql_col[])
+      sql_col[i] = sql_col[i]
+      t += sql_col[i] + "," + x"0d" + x"0a"
+   enddo
+   t += sql_col[i]
+   sql = $replace(`"%" + $varname(sql_col[]) + "%"`, t, sql)
+   sql = $replace(`"%" + $varname(sql_table) + "%"`, sql_table, sql)
+   
+   'sql init:
+   if sqlDSN dp then
+      l-s:setDSN(sqldsn)
+   elseif sqlDSNfile dp then
+      l-s:useDSN(sqldsnfile)
+   endif
+   
+   if regid !dp then
+      (void)$dbstart(db, readid)
+   else
+      readid = regid
+   endif
+
+   rc = $tempfile(tFile)
+
+   if arch_path dp and arch_clean = "Y" then
+      T = arch_path + "/" + sql_table
+      if $checkfile(T) = 0 then
+         rc = $filedelete(T)
+         if rc > 0 then
+            $errmsg1 = $fmt(rc,"ERROR removing file. RC:99 ") + T
+            return
+         endif
+      endif
+   endif
+
+   if sql_create = "Y" then
+      T = $replace(`"%" + $varname(sql_table) + "%"`, sql_table, sql-create)
+      ' create the column definitions
+      $clear(dsttype, sql_col_def)
+      'clear the sql column definition
+      $clear(sql_col_def)
+     
+      'add the readid column
+      sql_col_def += id_col_def + " nvarchar(10),"
+
+      'add the dst columns
+      i = 0
+      do while i++ < $maxarray(dst[])
+         rc = $dstinfo(dst[i], dstinfo[])
+         dsttype = dstinfo[5]
+         if dst_lkp[i] dp then
+            dsttype = "X"
+         endif
+         'dsttype = $dsttype(dst[i])
+         select dsttype
+            case "X"   dsttype = "nvarchar(64)"
+            case "H"   dsttype = "float"
+            case "B"   dsttype = "int"
+            case "N"   dsttype = "float"
+            case "T"   dsttype = "DateTime"
+            case "D"   dsttype = "DateTime"
+            case "DBTEXT"   dsttype = "nvarchar(max)"
+            case "DBTEXT-L" dsttype = "nvarchar(max)"
+         endselect
+         dstname = sql_col[i]
+         sql_col_def += $replace(".", "_", dstname) + " " + dsttype + "," + x"0a"
+      enddo
+
+      'remove the trailing comma and LF so the SQL is valid
+      rc = $len(sql_col_def) - 2
+      sql_col_def = $seg(sql_col_def, 1, rc)
+      T = $replace(`"%" + $varname(sql_col_def) + "%"`, sql_col_def, T)
+
+      rc = l-s:q(T)
+      if rc > 0 then
+         $errmsg1 = $fmt(rc, "ERR: on Create Table: RC:99")
+         (void)$email(admin,`$scriptid + " " + parmfile + " CREATE TABLE ERROR"`, T)
+         return
+      endif
+   endif
+
+   if sql_truncate = "Y" then
+      T = "TRUNCATE TABLE " + sql_table + ";"
+      rc = l-s:q(T)
+      if rc > 0 then
+         $errmsg1 = "ERR: " + T
+         return
+      endif
+   endif
+   
+   if skipparm dp then
+      rc = $getparm(skip[],skipparm)
+   endif
+goback
+
+end sql-export
+
+%include inc_GetParm
+%include inc_GetOption
