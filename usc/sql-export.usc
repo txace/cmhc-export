@@ -98,6 +98,7 @@ ptr         is i
 regclean    is x
 recclean    is x
 reglimit    is n
+no_ndp      is x
 reg_cnt     is n
 layers      is n
 layer_cnt   is n
@@ -183,6 +184,11 @@ __MAIN:
 goback
 
 _SQLGEN:
+
+   'skip if we don't want to process blank records
+   if no_ndp = "Y" and values[] !dp then
+      goback
+   endif
 
    '* map effective dates
    if dst_eff[] dp then
