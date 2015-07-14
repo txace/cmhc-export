@@ -1,0 +1,22 @@
+{
+  "name": "cmhc-export",
+  "version": "0.0.0",
+  "description": "This is a collection of scripts that you can use to export data from a CMHC/MIS system.",
+  "main": "deploy.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://argmonster@github.com/txace/cmhc-export.git"
+  },
+  "author": "Tim Markello",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/txace/cmhc-export/issues"
+  },
+  "homepage": "https://github.com/txace/cmhc-export#readme",
+  "dependencies": {
+    "mis-util": "^0.5.6"
+  }
+}
